@@ -63,6 +63,39 @@ static uint64_t bridge_bounce_flush_thresh(void) {
     }
     return (uint64_t)s_t;
 }
+
+/*
+ * Ordinary carts need the legacy interpreter-relative SPC pacing while the
+ * IPL ROM is mapped: early CPU<->SPC handshakes must be able to advance the
+ * SPC before normal frame pacing has fully taken ownership.
+ *
+ * Once the SPC clears $F1 bit 7 and unmaps its IPL ROM, RtlRunFrame's
+ * absolute guest timeline becomes authoritative. Continuing to apply the
+ * interpreter-relative catch-up after that point advances the SPC twice,
+ * over-produces DSP PCM, and can overflow the output ring.
+ *
+ * SA-1 retains its existing absolute-timeline policy. If an ordinary SPC
+ * later remaps the IPL ROM, this automatically falls back to relative pacing.
+ */
+static bool bridge_use_absolute_apu_timeline(void) {
+    const bool frame_timeline = rtl_apu_frame_timeline_active();
+
+    const bool is_sa1 =
+        g_snes &&
+        g_snes->cart &&
+        cart_has_sa1(g_snes->cart);
+
+    const bool spc_ipl_unmapped =
+        g_snes &&
+        g_snes->apu &&
+        !g_snes->apu->romReadable;
+
+    if (interp_bridge_use_absolute_apu_timeline(
+            frame_timeline, is_sa1))
+        return true;
+
+    return frame_timeline && spc_ipl_unmapped;
+}
 #ifdef SNESRECOMP_INTERP_PROFILE
 #include <time.h>
 uint64_t apu_prof_calls = 0;
@@ -77,9 +110,7 @@ static void bridge_apu_flush(CpuState *cpu) {
       apu_prof_calls++; }
     clock_t _t0 = clock();
 #endif
-    if (interp_bridge_use_absolute_apu_timeline(
-            rtl_apu_frame_timeline_active(),
-            g_snes && cart_has_sa1(g_snes->cart))) {
+    if (bridge_use_absolute_apu_timeline()) {
         /* Skip snes_catchupApu (legacy relative catch-up) to avoid
          * double-counting with the absolute guest-clock sync below.
          * But we MUST still call rtl_sync_apu_to_cpu_locked() to advance
@@ -1713,9 +1744,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             {
                 /* Guest-time APU, batched (see bridge_apu_flush): accumulate;
                  * convert on APU-port access / ~4096 master / exits. */
-                if (!interp_bridge_use_absolute_apu_timeline(
-                        rtl_apu_frame_timeline_active(),
-                        g_snes && cart_has_sa1(g_snes->cart))) {
+                if (!bridge_use_absolute_apu_timeline()) {
                     s_apu_pending_master += _master;
                     if (s_apu_pending_master >= bridge_bounce_flush_thresh()) bridge_apu_flush(cpu);
                 }
