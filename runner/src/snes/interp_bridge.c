@@ -49,6 +49,8 @@ static const double kInterpApuPerMaster = (32040.0 * 32.0) / (1364.0 * 262.0 * 6
  * AOT bounce. Game-thread only (like the interp itself); nesting shares the
  * accumulator safely because flushing early is always correct. */
 static uint64_t s_apu_pending_master = 0;
+static bool s_apu_boot_ready_seen = false;
+static bool s_apu_boot_handoff_complete = false;
 /* Master-cycle threshold below which the pre-AOT-bounce flush is skipped (see
  * the bounce site). 4096 (~1 output sample of SPC time) matches the periodic
  * batch-flush threshold. Env override SNESRECOMP_LLE_APU_FLUSH_THRESH is a
@@ -77,6 +79,16 @@ static uint64_t bridge_bounce_flush_thresh(void) {
  * SA-1 retains its existing absolute-timeline policy. If an ordinary SPC
  * later remaps the IPL ROM, this automatically falls back to relative pacing.
  */
+/*
+ * Before the first host frame, boot/IPL handshakes use the legacy
+ * interpreter-relative SPC clock so polling code can make progress.
+ *
+ * RtlRunFrame establishes the authoritative absolute guest-frame timeline
+ * before frame code can access the APU. From that point onward it must be
+ * the sole owner of SPC progression. IPL-ROM mapping is not a reliable
+ * handoff signal: some games, including Lufia I / Estpolis Denki I, leave
+ * the IPL ROM mapped during normal gameplay.
+ */
 static bool bridge_use_absolute_apu_timeline(void) {
     const bool frame_timeline = rtl_apu_frame_timeline_active();
 
@@ -85,16 +97,24 @@ static bool bridge_use_absolute_apu_timeline(void) {
         g_snes->cart &&
         cart_has_sa1(g_snes->cart);
 
-    const bool spc_ipl_unmapped =
-        g_snes &&
-        g_snes->apu &&
-        !g_snes->apu->romReadable;
-
     if (interp_bridge_use_absolute_apu_timeline(
             frame_timeline, is_sa1))
         return true;
 
-    return frame_timeline && spc_ipl_unmapped;
+    /* Use relative SPC timing through IPL upload, then frame timing. */
+    if (g_snes && g_snes->apu && g_snes->apu->spc) {
+        if (!s_apu_boot_ready_seen &&
+            g_snes->apu->outPorts[0] == 0xaa &&
+            g_snes->apu->outPorts[1] == 0xbb)
+            s_apu_boot_ready_seen = true;
+
+        if (!s_apu_boot_handoff_complete &&
+            s_apu_boot_ready_seen &&
+            g_snes->apu->spc->pc < 0xffc0)
+            s_apu_boot_handoff_complete = true;
+    }
+
+    return frame_timeline && s_apu_boot_handoff_complete;
 }
 #ifdef SNESRECOMP_INTERP_PROFILE
 #include <time.h>
@@ -176,6 +196,9 @@ void interp_bridge_reset_dynamic_cache(void) {
     s_interp_continuous_read_epoch = 0;
     s_interp_dynamic_progress_epoch = 0;
     g_interp_bridge_write_epoch = 0;
+    s_apu_pending_master = 0;
+    s_apu_boot_ready_seen = false;
+    s_apu_boot_handoff_complete = false;
 }
 
 /* Match Recompiler/snes_cycles.py::region_speed. During an interpreted
